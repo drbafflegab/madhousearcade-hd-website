@@ -1041,10 +1041,15 @@ const REPORT = { none: 0, still: 1, silent: 2, idle: 4, save: 8 };
 // page because it is a table rather than an event handler: what arrives is a
 // `KeyboardEvent.code`, which is a string, and mapping one to a button needs no
 // browser at all. The page owns the listeners; this owns what they mean.
+//
+// Space is `a` as well and Backspace `b`, in every game: Space is the main
+// action and Backspace takes one back, which is how Stuffit reads its two, the
+// next worm and an undo. The page cancels both, as it cancels every key here,
+// so a text field ever added to it has to be given Backspace back.
 const KEYS = {
     ArrowUp: "up", KeyW: "up", ArrowDown: "down", KeyS: "down",
     ArrowLeft: "left", KeyA: "left", ArrowRight: "right", KeyD: "right",
-    KeyZ: "a", Comma: "a", KeyX: "b", Period: "b",
+    KeyZ: "a", Comma: "a", Space: "a", KeyX: "b", Period: "b", Backspace: "b",
 };
 
 // The pointer's buttons, by the same argument and in the same place: what
@@ -9709,10 +9714,13 @@ function controlsLine (session) {
 // The label is what the CONSOLE calls the thing, not what the key does in the
 // game: a page that has not inspected a game cannot say what `a` means in it,
 // and a legend that guessed would be wrong per game rather than wrong once.
+//
+// `a` and `b` are advertised by Space and Backspace alone, the keys the owner
+// chose for them; Z, comma, X and period still press them, as `KEYS` says.
 const LEGENDS = {
     buttons: [
         { keys: ["↑", "↓", "←", "→"], label: "move" },
-        { keys: ["Z", "X"], label: "a / b" }
+        { keys: ["Space", "⌫"], label: "a / b" }
     ],
 
     // The one line of glyph vocabulary a pointer game needed and the page had
