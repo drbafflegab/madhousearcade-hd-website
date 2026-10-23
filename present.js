@@ -12,15 +12,23 @@
 // to the pixel are `products/raster`'s, whose `DECISIONS.md` says which case
 // pins each. What this file does with them:
 //
-// - The list is copied as it stands into one instance buffer, because the
-//   record maps onto WebGL2's integer attributes at a 32-byte stride: `source`
-//   as four `UNSIGNED_SHORT` at 4, the rectangle as four `INT` at 12, `angle`
-//   and `flags` as two `UNSIGNED_SHORT` at 28, each with a divisor of 1.
-//   Consecutive sprites from one texture are one instanced draw, and since
-//   WebGL2 has no base instance the attributes are pointed at each run's first
-//   record. The page pays for runs rather than sprites (`docs/runs/
-//   webgl2-probe-run.md` section 4), and does not reorder the list, because
-//   list order is drawing order.
+// - The list is copied as it stands into one instance buffer, because both
+//   kinds of record map onto WebGL2's integer attributes at a 32-byte stride:
+//   a sprite's `source` as four `UNSIGNED_SHORT` at 4, its rectangle as four
+//   `INT` at 12, `angle` and `flags` as two `UNSIGNED_SHORT` at 28; a shape's
+//   colour as four `UNSIGNED_BYTE` at 0, its ends as four `INT` at 4, and
+//   `half_width` and `radius` as two `INT` at 20; each with a divisor of 1.
+//   The list is cut into runs by kind first, read off `game_shape_flag` in the
+//   `flags` both carry at 30, and a run of sprites by texture after, so a
+//   shape's colour, which sits where a sprite's `texture` does, is never
+//   looked up as one. Consecutive sprites from one texture are one instanced
+//   draw, and so are consecutive shapes whatever their colours, since a shape
+//   reads no texture; a shape between two sprites of one texture splits their
+//   run, so it costs that run a draw beside its own. Since WebGL2 has no base
+//   instance the attributes are pointed at each run's first record. The page
+//   pays for runs rather than records (`docs/runs/webgl2-probe-run.md`
+//   section 4), and does not reorder the list, because list order is drawing
+//   order across both kinds.
 // - The vertex shader divides by 256 and 65,536 and turns the rectangle about
 //   its centre. A turn is folded to its quarter first and the sine taken of
 //   what is left, so a quarter turn is exact, as `products/raster`'s 20-bit
@@ -31,8 +39,21 @@
 //   reads it with `textureLod` on a sampler that is linear within and between
 //   levels and clamps to each level's edge. The GPU's own per-pixel estimate
 //   is not used.
+// - A shape is drawn by a program and a vertex array of its own, on its box
+//   grown by a picture pixel along its axis and across it, so no triangle edge
+//   touches a pixel it covers and the GPU breaks no tie. Its figures cross as
+//   integers, and the ends' sum and difference are taken in integers before
+//   either becomes a float, which the bound `host_core_check_sprites` holds
+//   them to keeps exact; times `P / 512` or `P / 256`, a power of two, they
+//   stay exact in picture pixels. The colour is premultiplied in integers,
+//   `round (c * a / 255)`, as a texel is. Each fragment takes `d`, its
+//   centre's signed distance to the box's edge, in floats from those, and is
+//   covered by `clamp (0.5 - d, 0, 1)`; a `half_width` of zero folds the box
+//   to a point and draws nothing. `raster_coverage` carries `d` in integers
+//   and rounds it its own way, and the two are held to each other only within
+//   the conformance tolerance.
 // - Blending is premultiplied, `ONE, ONE_MINUS_SRC_ALPHA`, over a picture
-//   cleared to `background`.
+//   cleared to `background`, for both kinds.
 //
 // THE LIST IS DRAWN INTO PICTURES, NEVER INTO THE DISPLAY. `compositeScales`
 // in `player.js` names the pictures a display at the box's scale is shown, at
@@ -77,13 +98,19 @@
 // console's: a texture of its own size per run rather than one sheet size, the
 // level rounded as the rasterizer rounds it, the turn folded to its quarter, a
 // viewport that letterboxes the frame, and the scissor and the readback a
-// probe needs. The probe stays as phase 2 ran it, because its readings in that
-// log are readings of its own code.
+// probe needs. The shape's program is this file's alone: the probe never drew
+// one. The probe stays as phase 2 ran it, because its readings in that log are
+// readings of its own code.
 
 'use strict';
 
 const PRESENT_RECORD_BYTES = 32;
 const PRESENT_LEVELS = 4;
+
+// `game_shape_flag`, the bit of `flags` that makes a record a shape, and where
+// `flags` sits in a record of either kind.
+const PRESENT_SHAPE_FLAG = 1 << 15;
+const PRESENT_FLAGS_AT = 30;
 
 const PRESENT_VERTEX = `#version 300 es
 layout (location = 0) in vec2 corner;
@@ -141,6 +168,80 @@ void main () {
     float lod = clamp (log2 (shrink), 0.0, 3.0);
 
     colour = textureLod (levels, uv, floor (lod * 256.0 + 0.5) / 256.0);
+}
+`;
+
+// The shape, in picture pixels with `y` down, as the frame's own: `picture`
+// is the picture's size and `scale` its `P`. What crosses to the fragment is
+// the box as `raster_coverage` measures from it - its centre, its axis's
+// direction, how far the rectangle its corners are rounded about reaches along
+// the axis and across it, and the radius - and the colour premultiplied.
+const PRESENT_SHAPE_VERTEX = `#version 300 es
+layout (location = 0) in vec2 corner;
+layout (location = 1) in uvec4 rgba;
+layout (location = 2) in ivec4 ends;
+layout (location = 3) in ivec2 sizes;
+
+uniform vec2 picture;
+uniform float scale;
+
+flat out vec2 centre;
+flat out vec2 along;
+flat out vec3 reach;
+flat out vec4 shade;
+
+void main () {
+    vec2 sum = vec2 (ends.xy + ends.zw);
+    vec2 axis = vec2 (ends.zw - ends.xy);
+    float span = length (axis);
+    vec2 direction = span > 0.0 ? axis / span : vec2 (1.0, 0.0);
+    vec2 middle = sum * (scale / 512.0);
+
+    float halfLength = span * (scale / 512.0);
+    float halfWidth = float (sizes.x) * (scale / 256.0);
+    float radius = float (sizes.y) * (scale / 256.0);
+
+    uvec3 premultiplied = (rgba.rgb * rgba.a + 127u) / 255u;
+
+    vec2 grown = sizes.x > 0
+        ? vec2 (halfLength + halfWidth + 1.0, halfWidth + 1.0) : vec2 (0.0);
+    vec2 local = (corner * 2.0 - 1.0) * grown;
+    vec2 at = middle + direction * local.x
+        + vec2 (-direction.y, direction.x) * local.y;
+
+    centre = middle;
+    along = direction;
+    reach = vec3 (halfLength + halfWidth - radius, halfWidth - radius, radius);
+    shade = vec4 (vec3 (premultiplied), float (rgba.a)) / 255.0;
+
+    gl_Position = vec4 (at.x / picture.x * 2.0 - 1.0,
+        1.0 - at.y / picture.y * 2.0, 0.0, 1.0);
+}
+`;
+
+// `gl_FragCoord` is a pixel's centre with `y` up, turned to the frame's `y`
+// down. `past` is how far the centre lies beyond the inner rectangle along the
+// axis and across it, and `d` the rounded box's signed distance from it.
+const PRESENT_SHAPE_FRAGMENT = `#version 300 es
+precision highp float;
+
+uniform vec2 picture;
+
+flat in vec2 centre;
+flat in vec2 along;
+flat in vec3 reach;
+flat in vec4 shade;
+
+out vec4 colour;
+
+void main () {
+    vec2 at = vec2 (gl_FragCoord.x, picture.y - gl_FragCoord.y) - centre;
+    vec2 past = abs (vec2 (dot (at, along), at.y * along.x - at.x * along.y))
+        - reach.xy;
+    float d = length (max (past, 0.0)) + min (max (past.x, past.y), 0.0)
+        - reach.z;
+
+    colour = shade * clamp (0.5 - d, 0.0, 1.0);
 }
 `;
 
@@ -205,8 +306,8 @@ class Presenter {
         this.build ();
     }
 
-    // Everything a context loses when it is lost, made again: the two
-    // programs, the two vertex arrays, the corner buffer and an instance
+    // Everything a context loses when it is lost, made again: the three
+    // programs, the three vertex arrays, the corner buffer and an instance
     // buffer of no size. The textures are not among them - they came from
     // files this file never saw - so a restored context draws nothing a list
     // names until the run is reset. The pictures are, and the first draw makes
@@ -221,26 +322,36 @@ class Presenter {
         const gl = this.gl;
 
         this.program = this.link (PRESENT_VERTEX, PRESENT_FRAGMENT);
+        this.shapeProgram = this.link (PRESENT_SHAPE_VERTEX,
+            PRESENT_SHAPE_FRAGMENT);
         this.resample = this.link (PRESENT_RESAMPLE_VERTEX,
             PRESENT_RESAMPLE_FRAGMENT);
         this.vao = gl.createVertexArray ();
+        this.shapeVao = gl.createVertexArray ();
         this.quad = gl.createVertexArray ();
         this.corners = gl.createBuffer ();
         this.instances = gl.createBuffer ();
         this.capacity = 0;
 
-        gl.bindVertexArray (this.vao);
         gl.bindBuffer (gl.ARRAY_BUFFER, this.corners);
         gl.bufferData (gl.ARRAY_BUFFER, new Float32Array ([0, 0, 1, 0, 0, 1, 1, 1]),
             gl.STATIC_DRAW);
-        gl.enableVertexAttribArray (0);
-        gl.vertexAttribPointer (0, 2, gl.FLOAT, false, 0, 0);
 
-        gl.bindBuffer (gl.ARRAY_BUFFER, this.instances);
+        // A sprite's array and a shape's: the same four corners, and three
+        // attributes per instance that `point` and `pointShapes` aim at a
+        // run's first record.
+        for (const vao of [this.vao, this.shapeVao]) {
+            gl.bindVertexArray (vao);
+            gl.bindBuffer (gl.ARRAY_BUFFER, this.corners);
+            gl.enableVertexAttribArray (0);
+            gl.vertexAttribPointer (0, 2, gl.FLOAT, false, 0, 0);
 
-        for (const location of [1, 2, 3]) {
-            gl.enableVertexAttribArray (location);
-            gl.vertexAttribDivisor (location, 1);
+            gl.bindBuffer (gl.ARRAY_BUFFER, this.instances);
+
+            for (const location of [1, 2, 3]) {
+                gl.enableVertexAttribArray (location);
+                gl.vertexAttribDivisor (location, 1);
+            }
         }
 
         // The resample's quad is the same four corners with nothing per
@@ -257,6 +368,11 @@ class Presenter {
             sheet: gl.getUniformLocation (this.program, 'sheet'),
             scale: gl.getUniformLocation (this.program, 'scale'),
             levels: gl.getUniformLocation (this.program, 'levels'),
+        };
+
+        this.shaped = {
+            picture: gl.getUniformLocation (this.shapeProgram, 'picture'),
+            scale: gl.getUniformLocation (this.shapeProgram, 'scale'),
         };
 
         this.across = {
@@ -564,7 +680,12 @@ class Presenter {
     // The list drawn into `picture`, cleared to the colour already set, with
     // the instance buffer already holding its `count` records. Answers how
     // many draws it cost and how many sprites named a texture it does not
-    // hold.
+    // hold, which a shape never does: it names nothing.
+    //
+    // A run is cut by kind before it is cut by texture, so consecutive shapes
+    // are one draw and a shape's colour, at a sprite's `texture`, is never
+    // looked up. Each program keeps its uniforms across a switch, so both are
+    // set once a picture and a run of the other kind only rebinds.
     list (picture, records, count, frameWidth, frameHeight) {
         const gl = this.gl;
 
@@ -574,6 +695,11 @@ class Presenter {
 
         gl.enable (gl.BLEND);
         gl.blendFunc (gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+        gl.useProgram (this.shapeProgram);
+        gl.uniform2f (this.shaped.picture, picture.width, picture.height);
+        gl.uniform1f (this.shaped.scale, picture.scale);
+
         gl.useProgram (this.program);
         gl.uniform2f (this.at.frame, frameWidth, frameHeight);
         gl.uniform1f (this.at.scale, picture.scale);
@@ -583,25 +709,45 @@ class Presenter {
         gl.bindVertexArray (this.vao);
         gl.bindBuffer (gl.ARRAY_BUFFER, this.instances);
 
-        let draws = 0, missing = 0, start = 0;
+        const shape = (index) => (records.getUint16 (
+            index * PRESENT_RECORD_BYTES + PRESENT_FLAGS_AT, true)
+            & PRESENT_SHAPE_FLAG) !== 0;
+
+        const texture = (index) =>
+            records.getUint32 (index * PRESENT_RECORD_BYTES, true);
+
+        let draws = 0, missing = 0, start = 0, shapes = false;
 
         while (start < count) {
-            const id = records.getUint32 (start * PRESENT_RECORD_BYTES, true);
+            const shaped = shape (start);
+            const id = shaped ? 0 : texture (start);
             let end = start + 1;
 
-            while (end < count
-                && records.getUint32 (end * PRESENT_RECORD_BYTES, true) === id)
+            while (end < count && shape (end) === shaped
+                && (shaped || texture (end) === id))
             {
                 end++;
             }
 
-            const held = this.textures.get (id);
+            const held = shaped ? null : this.textures.get (id);
 
-            if (held) {
-                this.point (start);
+            if (shaped || held) {
+                if (shapes !== shaped) {
+                    shapes = shaped;
 
-                gl.uniform2f (this.at.sheet, held.width, held.height);
-                gl.bindTexture (gl.TEXTURE_2D, held.texture);
+                    gl.useProgram (shaped ? this.shapeProgram : this.program);
+                    gl.bindVertexArray (shaped ? this.shapeVao : this.vao);
+                }
+
+                if (shaped) {
+                    this.pointShapes (start);
+                } else {
+                    this.point (start);
+
+                    gl.uniform2f (this.at.sheet, held.width, held.height);
+                    gl.bindTexture (gl.TEXTURE_2D, held.texture);
+                }
+
                 gl.drawArraysInstanced (gl.TRIANGLE_STRIP, 0, 4, end - start);
 
                 draws++;
@@ -630,6 +776,18 @@ class Presenter {
         gl.vertexAttribIPointer (2, 4, gl.INT, PRESENT_RECORD_BYTES, base + 12);
         gl.vertexAttribIPointer (3, 2, gl.UNSIGNED_SHORT, PRESENT_RECORD_BYTES,
             base + 28);
+    }
+
+    // The same for a run of shapes, on the shape's vertex array: the colour's
+    // four channels, the two ends, and `half_width` and `radius`.
+    pointShapes (first) {
+        const gl = this.gl;
+        const base = first * PRESENT_RECORD_BYTES;
+
+        gl.vertexAttribIPointer (1, 4, gl.UNSIGNED_BYTE, PRESENT_RECORD_BYTES,
+            base);
+        gl.vertexAttribIPointer (2, 4, gl.INT, PRESENT_RECORD_BYTES, base + 4);
+        gl.vertexAttribIPointer (3, 2, gl.INT, PRESENT_RECORD_BYTES, base + 20);
     }
 
     // Solid rectangles over the picture, in frame pixels, through `box`: the
@@ -748,5 +906,6 @@ function presentFlip (pixels, width, height) {
 
 if (typeof module !== 'undefined') {
     module.exports = { Presenter, presentCut, presentFlip,
-        PRESENT_RECORD_BYTES, PRESENT_LEVELS };
+        PRESENT_RECORD_BYTES, PRESENT_LEVELS, PRESENT_SHAPE_FLAG,
+        PRESENT_FLAGS_AT };
 }

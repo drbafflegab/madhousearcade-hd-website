@@ -383,7 +383,8 @@ const CORE = {
     //       | [sizeof=60, align=4]
     sprites: { drawable: 0, overflowing: 1, flagged: 2, negativeWidth: 3,
                negativeHeight: 4, dead: 5, untextured: 6, empty: 7,
-               outside: 8 },
+               outside: 8, reserved: 9, negativeHalfWidth: 10,
+               misrounded: 11, far: 12 },
     checked: { verdict: 0, index: 4, count: 8, capacity: 12, sprite: 16,
                scope: 48, width: 52, height: 56, bytes: 60 },
 
@@ -743,6 +744,7 @@ function textureRefusal (file, texture, size) {
 // sentences byte for byte, or null for a list that may be drawn.
 function spriteRefusal (checked) {
     const source = checked.source;
+    const ends = checked.ends;
 
     switch (checked.verdict) {
         case CORE.sprites.overflowing:
@@ -750,9 +752,11 @@ function spriteRefusal (checked) {
                 + `game's list holds ${checked.capacity}; max_sprite_count is `
                 + `the most one frame may list`;
         case CORE.sprites.flagged:
-            return `render_video listed sprite ${checked.index} with flags `
-                + `${checked.flags}; no flag is defined yet, and a bit set is `
-                + `refused`;
+            return `render_video listed `
+                + `${checked.flags & SHAPE_FLAG ? "shape" : "sprite"} `
+                + `${checked.index} with flags ${checked.flags}; `
+                + `game_shape_flag is the one flag defined, and any other bit `
+                + `set is refused`;
         case CORE.sprites.negativeWidth:
             return `render_video listed sprite ${checked.index} with a width of `
                 + `${checked.spriteWidth}; a size is never negative`;
@@ -776,6 +780,24 @@ function spriteRefusal (checked) {
                 + `of ${source [0]} ${source [1]} ${source [2]} ${source [3]}, `
                 + `past its texture's level 0 of ${checked.width} by `
                 + `${checked.height}`;
+        case CORE.sprites.reserved:
+            return `render_video listed shape ${checked.index} with reserved `
+                + `${checked.reserved}; a shape's reserved field is zero`;
+        case CORE.sprites.negativeHalfWidth:
+            return `render_video listed shape ${checked.index} with a `
+                + `half_width of ${checked.halfWidth}; a size is never `
+                + `negative`;
+        case CORE.sprites.misrounded:
+            return `render_video listed shape ${checked.index} with a radius `
+                + `of ${checked.radius} and a half_width of `
+                + `${checked.halfWidth}; a radius is from 0 through its `
+                + `half_width`;
+        case CORE.sprites.far:
+            return `render_video listed shape ${checked.index} from `
+                + `${ends [0]} ${ends [1]} to ${ends [2]} ${ends [3]} with a `
+                + `half_width of ${checked.halfWidth}; each end lies within `
+                + `8388608 of 0 and a half_width is at most 8388608, 32768 `
+                + `frame pixels`;
     }
 
     return null;
@@ -945,6 +967,9 @@ const FRAME_RATE = 60;
 
 // `game_texture_size_max`, which a refusal of a texture past it quotes.
 const TEXTURE_SIZE_MAX = 4096;
+
+// `game_shape_flag`, which tells a refused shape from a refused sprite.
+const SHAPE_FLAG = 1 << 15;
 
 // The frame a module declares, read off its `Game`. What cannot be taken comes
 // back as `refusal`, the sentence `console.c` and `goldenhash.js` refuse the
@@ -1759,6 +1784,13 @@ class HostCore {
             spriteWidth: view.getInt32 (sprite + 20, true),
             spriteHeight: view.getInt32 (sprite + 24, true),
             flags: view.getUint16 (sprite + 30, true),
+            // The same 32 bytes read as the `Game_Shape` they are when
+            // `flags` carries `game_shape_flag`.
+            ends: [4, 8, 12, 16].map (offset =>
+                view.getInt32 (sprite + offset, true)),
+            halfWidth: view.getInt32 (sprite + 20, true),
+            radius: view.getInt32 (sprite + 24, true),
+            reserved: view.getUint16 (sprite + 28, true),
         };
     }
 
@@ -6373,6 +6405,8 @@ class Consumer {
     // What the last `renderVideo` listed, as the bytes a golden hashes: `count`
     // and the records the list holds of it, one run from `count` to the end of
     // the last record - the span `sprites_hash` in products/inspector hashes.
+    // Only the list's head is read here, so a shape crosses as the 32 bytes it
+    // is, and only `checkSprites` and `present.js` tell it from a sprite.
     get sprites () {
         const head = new DataView (this.memory.buffer, this.layout.video,
             LAYOUT.list.sprites);

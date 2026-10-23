@@ -97,10 +97,14 @@ let scrubbed = false;
 // this worker's exception and ends the run on.
 //
 // The list goes out as a golden hashes it - `count` and the records the list
-// holds of it - copied, because the instance writes the next one into the same
-// bytes. `live` is the textures the store named live when the description was
-// captured, which is how the page knows when a texture's unload has reached it;
-// a scrubbed list's rows are an old table's and retire nothing.
+// holds of it, sprites and shapes alike - copied, because the instance writes
+// the next one into the same bytes. Nothing here reads a record, so nothing
+// here tells a shape from a sprite: `present.js` does, as it draws. `live` is
+// the textures the store named live when the description was captured, read
+// off the store's rows rather than off the list, so a shape, which names
+// nothing in the store, cannot keep a texture alive; it is how the page knows
+// when a texture's unload has reached it, and a scrubbed list's rows are an
+// old table's and retire nothing.
 
 const draw = () => {
     if (! consumer) { return; }
